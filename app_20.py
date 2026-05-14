@@ -11,6 +11,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from PIL import Image, ImageDraw, ImageFont
 from datetime import datetime
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    GSPREAD_OK = True
+except ImportError:
+    GSPREAD_OK = False
 
 st.set_page_config(
     page_title="RFID·QR Material Manager",
@@ -200,6 +206,126 @@ def save_smtp_config(cfg):
     with open(SMTP_CONFIG_FILE, "w") as f:
         json.dump(cfg, f, indent=2)
 
+# ─────────────────────────────────────────────
+# GOOGLE SHEETS HELPERS
+# ─────────────────────────────────────────────
+GSHEETS_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+def get_gsheets_client():
+    """Return authenticated gspread client using Streamlit secrets."""
+    if not GSPREAD_OK:
+        return None
+    try:
+        creds_dict = dict(st.secrets["gsheets"]["credentials"])
+        # Fix newlines in private_key
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        creds = Credentials.from_service_account_info(creds_dict, scopes=GSHEETS_SCOPES)
+        return gspread.authorize(creds)
+    except Exception as e:
+        return None
+
+def get_inventory_sheet():
+    """Return the inventory worksheet or None."""
+    client = get_gsheets_client()
+    if not client:
+        return None
+    try:
+        spreadsheet_id = st.secrets["gsheets"]["spreadsheet_id"]
+        sheet_name     = st.secrets["gsheets"].get("sheet_name", "inventory")
+        sh = client.open_by_key(spreadsheet_id)
+        return sh.worksheet(sheet_name)
+    except Exception as e:
+        return None
+
+def get_inventory_df():
+    """Return inventory sheet as DataFrame, or None."""
+    ws = get_inventory_sheet()
+    if ws is None:
+        return None
+    try:
+        records = ws.get_all_records()
+        if not records:
+            return pd.DataFrame()
+        return pd.DataFrame(records)
+    except Exception:
+        return None
+
+def update_stock_after_checkout(tag_code, qty_approved, checkout_info):
+    """
+    Deduct qty_approved from Total Stock for the matching RFID Tag Code row.
+    Also records Last Updated, Last Checkout By, Last Checkout Date.
+    Returns (success: bool, message: str)
+    """
+    ws = get_inventory_sheet()
+    if ws is None:
+        return False, "Google Sheets not connected"
+    try:
+        # Find header row to get column indices
+        headers = ws.row_values(1)
+        col_tag     = headers.index("RFID Tag Code") + 1     if "RFID Tag Code"     in headers else None
+        col_stock   = headers.index("Total Stock") + 1       if "Total Stock"       in headers else None
+        col_updated = headers.index("Last Updated") + 1      if "Last Updated"      in headers else None
+        col_by      = headers.index("Last Checkout By") + 1  if "Last Checkout By"  in headers else None
+        col_date    = headers.index("Last Checkout Date") + 1 if "Last Checkout Date" in headers else None
+
+        if col_tag is None or col_stock is None:
+            return False, "Required columns (RFID Tag Code, Total Stock) not found in sheet"
+
+        # Find the row with matching tag_code
+        tag_col_vals = ws.col_values(col_tag)
+        try:
+            row_idx = tag_col_vals.index(tag_code) + 1  # 1-based
+        except ValueError:
+            return False, f"Tag code {tag_code} not found in Google Sheet"
+
+        # Read current stock
+        current_stock_str = ws.cell(row_idx, col_stock).value
+        try:
+            current_stock = float(str(current_stock_str).replace(",","").strip())
+        except (ValueError, TypeError):
+            return False, f"Cannot parse current stock value: {current_stock_str!r}"
+
+        new_stock = max(0.0, current_stock - float(qty_approved))
+        now_str   = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Batch update
+        updates = [(row_idx, col_stock, new_stock)]
+        if col_updated: updates.append((row_idx, col_updated, now_str))
+        if col_by:      updates.append((row_idx, col_by,      checkout_info.get("req_name","")))
+        if col_date:    updates.append((row_idx, col_date,    now_str))
+
+        for r, c, v in updates:
+            ws.update_cell(r, c, v)
+
+        return True, f"Stock updated: {current_stock} → {new_stock}"
+    except Exception as e:
+        return False, str(e)
+
+def get_stock_for_tag(tag_code):
+    """Return current Total Stock for a tag from Google Sheets, or None."""
+    ws = get_inventory_sheet()
+    if ws is None:
+        return None
+    try:
+        headers = ws.row_values(1)
+        col_tag   = headers.index("RFID Tag Code") + 1 if "RFID Tag Code" in headers else None
+        col_stock = headers.index("Total Stock") + 1   if "Total Stock"   in headers else None
+        if not col_tag or not col_stock:
+            return None
+        tag_vals = ws.col_values(col_tag)
+        if tag_code not in tag_vals:
+            return None
+        row_idx = tag_vals.index(tag_code) + 1
+        val = ws.cell(row_idx, col_stock).value
+        return float(str(val).replace(",","").strip()) if val else None
+    except Exception:
+        return None
+
+
 def send_email(subject, body_html, to_email):
     cfg = load_smtp_config()
     if not cfg.get("smtp_user") or not cfg.get("smtp_password"):
@@ -235,7 +361,9 @@ def checkout_email_body(tag_code, rec, req):
             <td style="padding:6px;font-weight:bold;">{mat}</td></tr>
         <tr><td style="padding:6px;color:#666;">Storage Bin</td>
             <td style="padding:6px;">{rec.get("Storage Bin","—")}</td></tr>
-        <tr style="background:#f5f7fa;"><td style="padding:6px;color:#666;">Requested by</td>
+        <tr style="background:#f5f7fa;"><td style="padding:6px;color:#666;">Quantity Requested</td>
+            <td style="padding:6px;font-weight:bold;color:#1a3a6b;">{req.get("req_quantity","?")} {req.get("req_uom","")}</td></tr>
+        <tr><td style="padding:6px;color:#666;">Requested by</td>
             <td style="padding:6px;">{req.get("req_name","—")}</td></tr>
         <tr><td style="padding:6px;color:#666;">Email</td>
             <td style="padding:6px;">{req.get("req_email","—")}</td></tr>
@@ -469,9 +597,32 @@ def show_checkout_page():
             st.markdown("---")
             st.markdown("### Step 3 — Fill in checkout details")
 
+            # Show live stock from Google Sheets
+            sel_tag_now = st.session_state.get(mat_key)
+            if sel_tag_now:
+                live_stock = get_stock_for_tag(sel_tag_now)
+                sel_rec_now = filtered.get(sel_tag_now, {})
+                uom_now = sel_rec_now.get("Base Unit of Measure","")
+                if live_stock is not None:
+                    st.info(f"📦 Available stock (Google Sheets): **{live_stock:.2f} {uom_now}**")
+                else:
+                    fallback_stock = sel_rec_now.get("Total Stock","?")
+                    st.info(f"📦 Available stock (local data): **{fallback_stock} {uom_now}**")
+
             name_input = st.text_input(
                 "Your full name *", placeholder="First Last",
                 key="co_name")
+
+            cq1, cq2 = st.columns([3, 1])
+            with cq1:
+                qty_input = st.number_input(
+                    "Quantity requested *",
+                    min_value=0.01, step=1.0, format="%.2f",
+                    key="co_qty")
+            with cq2:
+                uom_show = filtered.get(st.session_state.get(mat_key,""), {}).get("Base Unit of Measure","")
+                st.text_input("Unit", value=uom_show, disabled=True, key="co_uom_disp", label_visibility="visible")
+
             col1, col2 = st.columns(2)
             with col1:
                 date_from = st.date_input("Date from *", key="co_date_from")
@@ -501,6 +652,14 @@ def show_checkout_page():
                     errors.append("'Date to' must be after 'Date from'.")
                 if not purpose.strip():
                     errors.append("Purpose / Location is required.")
+                qty_val = float(st.session_state.get("co_qty", 0) or 0)
+                if qty_val <= 0:
+                    errors.append("Quantity must be greater than 0.")
+                else:
+                    # Check stock availability
+                    live_chk = get_stock_for_tag(st.session_state.get(mat_key,""))
+                    if live_chk is not None and qty_val > live_chk:
+                        errors.append(f"Requested quantity ({qty_val:.2f}) exceeds available stock ({live_chk:.2f}).")
 
                 if errors:
                     for e in errors:
@@ -519,6 +678,8 @@ def show_checkout_page():
                         "req_date_to":   str(date_to),
                         "req_timestamp": now_str,
                         "req_url":       req_url,
+                        "req_quantity":  qty_val,
+                        "req_uom":       sel_rec.get("Base Unit of Measure",""),
                     }
 
                     # Save pending request to tag record
@@ -540,7 +701,7 @@ def show_checkout_page():
 
                     # Clear form state
                     for k in ["co_step","co_email","co_mat","co_search",
-                              "co_mat_sel","co_name","co_purpose","co_email_input"]:
+                              "co_mat_sel","co_name","co_purpose","co_email_input","co_qty","co_uom_disp"]:
                         st.session_state.pop(k, None)
                     st.session_state["co_step"] = "done"
                     st.session_state["co_done_mat"] = sel_rec.get("Material Description","—")
@@ -954,6 +1115,7 @@ def show_viewer(tag_code):
             <b>By:</b> {checked_out.get("req_name","—")} ({checked_out.get("req_email","—")})<br>
             <b>Purpose:</b> {checked_out.get("req_purpose","—")}<br>
             <b>Period:</b> {checked_out.get("req_date_from","—")} → {checked_out.get("req_date_to","—")}<br>
+            <b>Quantity:</b> {checked_out.get("approved_qty", checked_out.get("req_quantity","?"))} {checked_out.get("req_uom","")}<br>
             <b>Approved at:</b> {checked_out.get("approved_at","—")}
           </div>
         </div>
@@ -969,6 +1131,7 @@ def show_viewer(tag_code):
             <b>Requested by:</b> {req.get("req_name","—")} ({req.get("req_email","—")})<br>
             <b>Purpose:</b> {req.get("req_purpose","—")}<br>
             <b>Period:</b> {req.get("req_date_from","—")} → {req.get("req_date_to","—")}<br>
+            <b>Quantity:</b> {req.get("req_quantity","?")} {req.get("req_uom","")}<br>
             <b>Submitted:</b> {req.get("req_timestamp","—")}
           </div>
         </div>
@@ -1045,38 +1208,80 @@ def show_viewer(tag_code):
     # ── Confirm Approve ───────────────────────────────────────
     if mode == "confirm_approve":
         req = rec.get("_checkout_request", {})
+        req_qty  = req.get("req_quantity", 1)
+        req_uom  = req.get("req_uom", rec.get("Base Unit of Measure",""))
+
+        # Show live stock from Google Sheets
+        live_stk = get_stock_for_tag(tag_code)
+        stock_display = f"{live_stk:.2f}" if live_stk is not None else rec.get("Total Stock","?")
+
         st.markdown(f"""
         <div style="background:#0f2a1a;border:2px solid #34d399;border-radius:12px;
             padding:1.2rem 1.4rem;margin-top:0.8rem;">
           <div style="font-size:1.1rem;font-weight:700;color:#34d399;margin-bottom:0.5rem;">
-              ✅ Confirm Approve Checkout</div>
-          <div style="color:#e8ecf4;font-size:0.95rem;line-height:1.7;">
-            Approve checkout for <b>{req.get("req_name","—")}</b><br>
-            Purpose: {req.get("req_purpose","—")}<br>
-            Period: {req.get("req_date_from","—")} → {req.get("req_date_to","—")}
+              ✅ Approve Checkout Request</div>
+          <div style="color:#e8ecf4;font-size:0.95rem;line-height:1.9;">
+            <b>Requested by:</b> {req.get("req_name","—")} ({req.get("req_email","—")})<br>
+            <b>Purpose:</b> {req.get("req_purpose","—")}<br>
+            <b>Period:</b> {req.get("req_date_from","—")} → {req.get("req_date_to","—")}<br>
+            <b>Quantity requested:</b> {req_qty} {req_uom}<br>
+            <b>Current stock:</b> {stock_display} {req_uom}
           </div>
         </div>
         """, unsafe_allow_html=True)
-        st.markdown(" ")
+
+        st.markdown("**Confirm quantity to approve:**")
+        approve_qty = st.number_input(
+            "Quantity to approve",
+            min_value=0.01,
+            max_value=float(live_stk) if live_stk is not None else float(req_qty) * 10,
+            value=float(req_qty),
+            step=1.0, format="%.2f",
+            key=f"v_approve_qty_{tag_code}"
+        )
+
         ap1, ap2 = st.columns(2)
         with ap1:
-            if st.button("✅ Yes, Approve", use_container_width=True,
+            if st.button("✅ Approve & Clear Tag", use_container_width=True,
                          type="primary", key=f"v_do_approve_{tag_code}"):
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                req["approved_at"] = now_str
-                data[tag_code]["_checked_out"] = req
-                data[tag_code].pop("_checkout_request", None)
+                req["approved_at"]    = now_str
+                req["approved_qty"]   = approve_qty
+                req["approved_uom"]   = req_uom
+
+                # 1. Update Google Sheets stock
+                gs_ok, gs_msg = update_stock_after_checkout(tag_code, approve_qty, req)
+
+                # 2. Save checkout history to tag record
+                history = data[tag_code].get("_checkout_history", [])
+                checkout_record = {**req, "returned_at": None}
+                history.append(checkout_record)
+
+                # 3. Clear RFID tag completely (ready for new registration)
+                data[tag_code] = {
+                    "RFID Tag Code":     tag_code,
+                    "_cleared":          True,
+                    "_cleared_at":       now_str,
+                    "_checkout_history": history,
+                }
                 save_data(data)
-                # Email requester
+
+                # 4. Email requester
                 cfg2 = load_smtp_config()
+                email_body = approve_email_body(tag_code, rec, req)
                 send_email(
-                    f"[Approved] Checkout for {rec.get('Material Description','')}",
-                    approve_email_body(tag_code, rec, req),
+                    f"[Approved] Checkout: {rec.get('Material Description','')} ({approve_qty} {req_uom})",
+                    email_body,
                     req.get("req_email","")
                 )
+
+                # Show result
                 st.session_state.pop(f"v_mode_{tag_code}", None)
                 st.session_state.pop(f"auth_ok_{tag_code}", None)
-                st.success("✅ Checkout approved! Email sent to requester.")
+                if gs_ok:
+                    st.success(f"✅ Approved! Stock updated in Google Sheets: -{approve_qty} {req_uom}. Tag cleared.")
+                else:
+                    st.warning(f"✅ Approved & tag cleared, but Google Sheets update failed: {gs_msg}")
                 st.rerun()
         with ap2:
             if st.button("✕ Cancel", use_container_width=True,
@@ -1294,6 +1499,44 @@ def tab_setup():
                 st.success("✅ Test email sent successfully.")
             else:
                 st.error(f"❌ Failed: {msg}")
+
+    # ── Google Sheets status ──────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 📊 Google Sheets (Master Inventory)")
+    if not GSPREAD_OK:
+        st.error("gspread library not installed. Add `gspread` and `google-auth` to requirements.txt")
+    else:
+        ws_test = get_inventory_sheet()
+        if ws_test:
+            st.success("✅ Connected to Google Sheets inventory")
+            try:
+                inv_df = get_inventory_df()
+                if inv_df is not None and not inv_df.empty:
+                    st.caption(f"{len(inv_df)} rows in inventory sheet")
+                    with st.expander("Preview inventory (first 10 rows)"):
+                        st.dataframe(inv_df.head(10), use_container_width=True)
+            except Exception as e:
+                st.warning(f"Could not load preview: {e}")
+        else:
+            st.warning("⚠️ Google Sheets not connected. Check Streamlit secrets.")
+            st.markdown("""
+**Required in Streamlit Secrets:**
+```toml
+[gsheets]
+spreadsheet_id = "your-sheet-id"
+sheet_name = "inventory"
+
+[gsheets.credentials]
+type = "service_account"
+project_id = "..."
+private_key_id = "..."
+private_key = "-----BEGIN RSA PRIVATE KEY-----\n...\n-----END RSA PRIVATE KEY-----\n"
+client_email = "rfid@project.iam.gserviceaccount.com"
+client_id = "..."
+auth_uri = "https://accounts.google.com/o/oauth2/auth"
+token_uri = "https://oauth2.googleapis.com/token"
+```
+            """)
 
     # ── Checkout QR ───────────────────────────────────────────
     st.markdown("**Checkout Request QR Code**")
