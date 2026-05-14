@@ -53,7 +53,7 @@ def get_master_df():
 # ─────────────────────────────────────────────
 # URL HELPER
 # ─────────────────────────────────────────────
-DEFAULT_APP_URL = "https://rfidpticmockup-qfn4gve2qgohbwaechw7qh.streamlit.app/"
+DEFAULT_APP_URL = "https://rfidpticmockup-qfn4gve2qgohbwaechw7qh.streamlit.app"
 
 def get_base_url():
     if st.session_state.get("base_url"):
