@@ -262,6 +262,104 @@ def get_inventory_df():
     except Exception as e:
         return None, f"Could not read sheet: {e}"
 
+def clear_rfid_in_sheet(old_tag_code):
+    """Remove RFID Tag Code from the old row in Google Sheets when tag is cleared.
+    Returns (success, message)."""
+    ws, err = get_inventory_sheet()
+    if ws is None:
+        return False, f"Sheet not connected: {err}"
+    try:
+        headers = ws.row_values(1)
+        col_tag = headers.index("RFID Tag Code") + 1 if "RFID Tag Code" in headers else None
+        if col_tag is None:
+            return False, "RFID Tag Code column not found"
+        tag_vals = ws.col_values(col_tag)
+        if old_tag_code not in tag_vals:
+            return True, "Tag not found in sheet (already cleared or never registered)"
+        row_idx = tag_vals.index(old_tag_code) + 1
+        ws.update_cell(row_idx, col_tag, "")
+        return True, f"Cleared RFID Tag Code from row {row_idx}"
+    except Exception as e:
+        return False, str(e)
+
+
+def register_new_item_in_sheet(new_vals):
+    """Register a newly saved tag into Google Sheets.
+    - If a row with matching Material already exists (no RFID tag), update that row.
+    - Otherwise append a new row.
+    Returns (success, message)."""
+    ws, err = get_inventory_sheet()
+    if ws is None:
+        return False, f"Sheet not connected: {err}"
+    try:
+        headers = ws.row_values(1)
+
+        def col_of(name):
+            return headers.index(name) + 1 if name in headers else None
+
+        col_tag = col_of("RFID Tag Code")
+        col_mat = col_of("Material")
+        if col_tag is None:
+            return False, "RFID Tag Code column not found in sheet"
+
+        tag_code   = new_vals.get("RFID Tag Code", "")
+        material   = new_vals.get("Material", "")
+        now_str    = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Try to find a matching row: same Material, empty RFID Tag Code
+        tag_col_vals = ws.col_values(col_tag)
+        mat_col_vals = ws.col_values(col_mat) if col_mat else []
+
+        target_row = None
+        # First priority: find row with same tag_code (re-registration of same tag)
+        if tag_code in tag_col_vals:
+            target_row = tag_col_vals.index(tag_code) + 1
+        # Second priority: find row with same material but empty RFID Tag Code
+        elif material and col_mat:
+            for i, (mat_v, tag_v) in enumerate(zip(mat_col_vals, tag_col_vals), start=1):
+                if str(mat_v).strip() == str(material).strip() and str(tag_v).strip() == "":
+                    target_row = i
+                    break
+
+        if target_row:
+            # Update existing row
+            updates = []
+            for field in EXPECTED_COLS:
+                c = col_of(field)
+                if c and field in new_vals:
+                    updates.append({
+                        "range": gspread.utils.rowcol_to_a1(target_row, c),
+                        "values": [[str(new_vals.get(field, ""))]]
+                    })
+            # Also update Last Updated
+            col_lu = col_of("Last Updated")
+            if col_lu:
+                updates.append({
+                    "range": gspread.utils.rowcol_to_a1(target_row, col_lu),
+                    "values": [[now_str]]
+                })
+            if updates:
+                ws.batch_update(updates)
+            return True, f"Updated existing row {target_row} in Google Sheets"
+        else:
+            # Append new row
+            new_row = [""] * len(headers)
+            for field in EXPECTED_COLS:
+                c = col_of(field)
+                if c and field in new_vals:
+                    new_row[c - 1] = str(new_vals.get(field, ""))
+            col_lu = col_of("Last Updated")
+            if col_lu:
+                new_row[col_lu - 1] = now_str
+            ws.append_row(new_row, value_input_option="USER_ENTERED")
+            return True, "Appended new row to Google Sheets"
+
+    except gspread.exceptions.APIError as e:
+        return False, f"API error: {e}"
+    except Exception as e:
+        return False, f"Error: {type(e).__name__}: {e}"
+
+
 def update_stock_after_checkout(tag_code, qty_approved, checkout_info):
     """
     Deduct qty_approved from Total Stock for the row matching RFID Tag Code.
@@ -1017,7 +1115,14 @@ def _show_edit_form(tag_code, rec, data, is_empty=False):
             data[tag_code] = new_vals
             save_data(data)
             _cleanup()
-            st.success(f"✅ Tag {tag_code} saved successfully!")
+
+            # Sync to Google Sheets
+            gs_ok2, gs_msg2 = register_new_item_in_sheet(new_vals)
+            if gs_ok2:
+                st.success(f"✅ Tag {tag_code} saved! Google Sheets updated: {gs_msg2}")
+            else:
+                st.success(f"✅ Tag {tag_code} saved locally.")
+                st.warning(f"⚠️ Google Sheets sync failed: {gs_msg2}")
             st.rerun()
 
     if cancel_clicked:
@@ -1313,10 +1418,10 @@ def show_viewer(tag_code):
                     st.rerun()
                 else:
                     # Stock still > 0 — update tag data, do NOT clear
-                    data[tag_code]["_checkout_request"] = None
-                    data[tag_code]["_checkout_history"] = history
-                    data[tag_code]["Total Stock"] = str(new_stock_after) if new_stock_after is not None else data[tag_code].get("Total Stock","")
                     data[tag_code].pop("_checkout_request", None)
+                    data[tag_code]["_checkout_history"] = history
+                    if new_stock_after is not None:
+                        data[tag_code]["Total Stock"] = str(new_stock_after)
                     save_data(data)
 
                     # Email requester
@@ -1329,7 +1434,7 @@ def show_viewer(tag_code):
                     st.session_state.pop(f"auth_ok_{tag_code}", None)
                     if gs_ok:
                         remaining = f"{new_stock_after:.2f}" if new_stock_after is not None else "?"
-                        st.success(f"✅ Approved! Stock updated: -{approve_qty:.2f} {req_uom} → remaining {remaining} {req_uom}")
+                        st.success(f"✅ Approved! Stock: -{approve_qty:.2f} → remaining {remaining} {req_uom}")
                     else:
                         st.error(f"⚠️ Approved & email sent, BUT Google Sheets update FAILED: {gs_msg}")
                     st.rerun()
@@ -1382,6 +1487,8 @@ def show_viewer(tag_code):
                     "_checkout_history": history,
                 }
                 save_data(data)
+                # Clear RFID Tag Code from Google Sheets old row
+                gs_clr_ok, gs_clr_msg = clear_rfid_in_sheet(tag_code)
                 send_email(
                     f"[Approved] Checkout: {rec.get('Material Description','')} ({approve_qty2} {req_uom2})",
                     approve_email_body(tag_code, rec, req_d),
@@ -1390,7 +1497,11 @@ def show_viewer(tag_code):
                 st.session_state.pop(f"v_mode_{tag_code}", None)
                 st.session_state.pop(f"auth_ok_{tag_code}", None)
                 st.session_state.pop(f"v_approve_done_{tag_code}", None)
-                st.success("✅ Approved & QR tag cleared. Ready for new registration.")
+                if gs_clr_ok:
+                    st.success(f"✅ Approved & QR cleared. Sheets updated: {gs_clr_msg}")
+                else:
+                    st.success("✅ Approved & QR tag cleared.")
+                    st.warning(f"⚠️ Sheets clear failed: {gs_clr_msg}")
                 st.rerun()
         with cc2:
             if st.button("📦 No, Keep Tag (stock = 0)", use_container_width=True,
@@ -1911,7 +2022,13 @@ def tab_register():
                     db3[tag_code] = new_vals
                     save_data(db3)
                     _rcleanup()
-                    st.success(f"✅ Tag **{tag_code}** registered!")
+                    # Sync to Google Sheets
+                    gs_r_ok, gs_r_msg = register_new_item_in_sheet(new_vals)
+                    if gs_r_ok:
+                        st.success(f"✅ Tag **{tag_code}** registered! Sheets: {gs_r_msg}")
+                    else:
+                        st.success(f"✅ Tag **{tag_code}** registered locally.")
+                        st.warning(f"⚠️ Sheets sync failed: {gs_r_msg}")
                     st.balloons()
 
             if rcancel:
@@ -2273,7 +2390,13 @@ def tab_manage():
                         data[tc] = new_vals
                         save_data(data)
                         _mcleanup()
-                        st.success("✅ Tag updated!")
+                        # Sync to Google Sheets
+                        gs_m_ok, gs_m_msg = register_new_item_in_sheet(new_vals)
+                        if gs_m_ok:
+                            st.success(f"✅ Tag updated! Sheets: {gs_m_msg}")
+                        else:
+                            st.success("✅ Tag updated locally.")
+                            st.warning(f"⚠️ Sheets sync failed: {gs_m_msg}")
                         st.rerun()
 
                     if mcancel:
