@@ -176,8 +176,8 @@ DEFAULT_PASSWORD = "RFID123"
 # ─────────────────────────────────────────────
 # CHECKOUT / EMAIL CONFIG
 # ─────────────────────────────────────────────
-DEFAULT_ALLOWED_DOMAIN = "@company.com"   # change in Setup
-DEFAULT_ADMIN_EMAIL    = "admin@company.com"
+DEFAULT_ALLOWED_DOMAIN = "@gmail.com"   # change in Setup
+DEFAULT_ADMIN_EMAIL    = "geoworkingstation@gmail.com"
 SMTP_CONFIG_FILE       = "smtp_config.json"
 
 def load_smtp_config():
@@ -187,8 +187,8 @@ def load_smtp_config():
     return {
         "smtp_host":      "smtp.gmail.com",
         "smtp_port":      587,
-        "smtp_user":      "",
-        "smtp_password":  "",
+        "smtp_user":      "geoworkingstation@gmail.com",
+        "smtp_password":  "ogrrsusoowdyhsea",
         "admin_email":    DEFAULT_ADMIN_EMAIL,
         "allowed_domain": DEFAULT_ALLOWED_DOMAIN,
     }
