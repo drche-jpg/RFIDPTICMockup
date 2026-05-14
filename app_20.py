@@ -53,7 +53,7 @@ def get_master_df():
 # ─────────────────────────────────────────────
 # URL HELPER
 # ─────────────────────────────────────────────
-DEFAULT_APP_URL = "https://rfidpticmockup-qfn4gve2qgohbwaechw7qh.streamlit.app/"
+DEFAULT_APP_URL = "https://rfidpticmockup-qfn4gve2qgohbwaechw7qh.streamlit.app"
 
 def get_base_url():
     if st.session_state.get("base_url"):
@@ -1211,7 +1211,7 @@ def show_viewer(tag_code):
 
     mode = st.session_state.get(f"v_mode_{tag_code}", "")
 
-    if mode in ("edit", "confirm_clear", "confirm_approve", "confirm_return"):
+    if mode in ("edit", "confirm_clear", "confirm_approve", "confirm_return", "ask_clear_after_approve"):
         if not check_viewer_auth(tag_code):
             st.markdown("---")
             show_password_gate(tag_code)
@@ -1283,22 +1283,98 @@ def show_viewer(tag_code):
 
         ap1, ap2 = st.columns(2)
         with ap1:
-            if st.button("✅ Approve & Clear Tag", use_container_width=True,
+            if st.button("✅ Approve", use_container_width=True,
                          type="primary", key=f"v_do_approve_{tag_code}"):
                 now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                req["approved_at"]    = now_str
-                req["approved_qty"]   = approve_qty
-                req["approved_uom"]   = req_uom
+                req["approved_at"]  = now_str
+                req["approved_qty"] = approve_qty
+                req["approved_uom"] = req_uom
 
                 # 1. Update Google Sheets stock
                 gs_ok, gs_msg = update_stock_after_checkout(tag_code, approve_qty, req)
 
-                # 2. Save checkout history to tag record
-                history = data[tag_code].get("_checkout_history", [])
-                checkout_record = {**req, "returned_at": None}
-                history.append(checkout_record)
+                # 2. Calculate new stock after deduction
+                new_stock_after = None
+                if live_stk is not None:
+                    new_stock_after = max(0.0, live_stk - float(approve_qty))
 
-                # 3. Clear RFID tag completely (ready for new registration)
+                # 3. Save checkout history
+                history = data[tag_code].get("_checkout_history", [])
+                history.append({**req, "returned_at": None})
+
+                if new_stock_after is not None and new_stock_after <= 0:
+                    # Stock reached 0 — ask whether to clear QR
+                    st.session_state[f"v_approve_done_{tag_code}"] = {
+                        "req": req, "history": history, "gs_ok": gs_ok,
+                        "gs_msg": gs_msg, "now_str": now_str,
+                        "new_stock": new_stock_after,
+                    }
+                    st.session_state[f"v_mode_{tag_code}"] = "ask_clear_after_approve"
+                    st.rerun()
+                else:
+                    # Stock still > 0 — update tag data, do NOT clear
+                    data[tag_code]["_checkout_request"] = None
+                    data[tag_code]["_checkout_history"] = history
+                    data[tag_code]["Total Stock"] = str(new_stock_after) if new_stock_after is not None else data[tag_code].get("Total Stock","")
+                    data[tag_code].pop("_checkout_request", None)
+                    save_data(data)
+
+                    # Email requester
+                    send_email(
+                        f"[Approved] Checkout: {rec.get('Material Description','')} ({approve_qty} {req_uom})",
+                        approve_email_body(tag_code, rec, req),
+                        req.get("req_email","")
+                    )
+                    st.session_state.pop(f"v_mode_{tag_code}", None)
+                    st.session_state.pop(f"auth_ok_{tag_code}", None)
+                    if gs_ok:
+                        remaining = f"{new_stock_after:.2f}" if new_stock_after is not None else "?"
+                        st.success(f"✅ Approved! Stock updated: -{approve_qty:.2f} {req_uom} → remaining {remaining} {req_uom}")
+                    else:
+                        st.error(f"⚠️ Approved & email sent, BUT Google Sheets update FAILED: {gs_msg}")
+                    st.rerun()
+
+        with ap2:
+            if st.button("✕ Cancel", use_container_width=True,
+                         key=f"v_cancel_approve_{tag_code}"):
+                st.session_state.pop(f"v_mode_{tag_code}", None)
+                st.session_state.pop(f"auth_ok_{tag_code}", None)
+                st.rerun()
+
+    # ── Ask clear after approve (stock = 0) ───────────────────
+    if mode == "ask_clear_after_approve":
+        done = st.session_state.get(f"v_approve_done_{tag_code}", {})
+        req_d    = done.get("req", {})
+        history  = done.get("history", [])
+        gs_ok    = done.get("gs_ok", False)
+        gs_msg   = done.get("gs_msg", "")
+        now_str  = done.get("now_str", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        req_uom2 = req_d.get("req_uom", "")
+        approve_qty2 = req_d.get("approved_qty", 0)
+
+        if gs_ok:
+            st.success(f"✅ Stock updated in Google Sheets: -{approve_qty2:.2f} {req_uom2}")
+        else:
+            st.error(f"⚠️ Google Sheets update FAILED: {gs_msg}")
+
+        st.markdown(f"""
+        <div style="background:#2a1a0a;border:2px solid #fbbf24;border-radius:12px;
+            padding:1.2rem 1.4rem;margin-top:0.8rem;">
+          <div style="font-size:1.1rem;font-weight:700;color:#fbbf24;margin-bottom:0.5rem;">
+              ⚠️ Stock is now 0</div>
+          <div style="color:#e8ecf4;font-size:0.95rem;line-height:1.8;">
+            After approving <b>{approve_qty2} {req_uom2}</b>, the remaining stock is <b>0</b>.<br><br>
+            Do you want to <b>clear this QR tag</b> (ready for new item registration)?<br>
+            Or <b>keep the tag</b> with 0 stock?
+          </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        st.markdown(" ")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            if st.button("🗑 Yes, Clear QR Tag", use_container_width=True,
+                         type="primary", key=f"v_clear_after_approve_{tag_code}"):
                 data[tag_code] = {
                     "RFID Tag Code":     tag_code,
                     "_cleared":          True,
@@ -1306,31 +1382,33 @@ def show_viewer(tag_code):
                     "_checkout_history": history,
                 }
                 save_data(data)
-
-                # 4. Email requester
-                cfg2 = load_smtp_config()
-                email_body = approve_email_body(tag_code, rec, req)
                 send_email(
-                    f"[Approved] Checkout: {rec.get('Material Description','')} ({approve_qty} {req_uom})",
-                    email_body,
-                    req.get("req_email","")
+                    f"[Approved] Checkout: {rec.get('Material Description','')} ({approve_qty2} {req_uom2})",
+                    approve_email_body(tag_code, rec, req_d),
+                    req_d.get("req_email","")
                 )
-
-                # Show result
                 st.session_state.pop(f"v_mode_{tag_code}", None)
                 st.session_state.pop(f"auth_ok_{tag_code}", None)
-                if gs_ok:
-                    st.success(f"✅ Approved! Stock updated in Google Sheets: -{approve_qty:.2f} {req_uom}  |  {gs_msg}  |  Tag cleared.")
-                else:
-                    st.error(f"⚠️ Tag cleared & email sent, BUT Google Sheets update FAILED: {gs_msg}")
-                    st.error("Please update the stock manually in Google Sheets.")
+                st.session_state.pop(f"v_approve_done_{tag_code}", None)
+                st.success("✅ Approved & QR tag cleared. Ready for new registration.")
                 st.rerun()
-        with ap2:
-            if st.button("✕ Cancel", use_container_width=True,
-
-                         key=f"v_cancel_approve_{tag_code}"):
+        with cc2:
+            if st.button("📦 No, Keep Tag (stock = 0)", use_container_width=True,
+                         key=f"v_keep_after_approve_{tag_code}"):
+                # Keep tag, update stock to 0
+                data[tag_code].pop("_checkout_request", None)
+                data[tag_code]["_checkout_history"] = history
+                data[tag_code]["Total Stock"] = "0"
+                save_data(data)
+                send_email(
+                    f"[Approved] Checkout: {rec.get('Material Description','')} ({approve_qty2} {req_uom2})",
+                    approve_email_body(tag_code, rec, req_d),
+                    req_d.get("req_email","")
+                )
                 st.session_state.pop(f"v_mode_{tag_code}", None)
                 st.session_state.pop(f"auth_ok_{tag_code}", None)
+                st.session_state.pop(f"v_approve_done_{tag_code}", None)
+                st.success("✅ Approved. Tag kept with stock = 0.")
                 st.rerun()
 
     # ── Confirm Return ────────────────────────────────────────
