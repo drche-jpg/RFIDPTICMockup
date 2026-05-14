@@ -53,7 +53,7 @@ def get_master_df():
 # ─────────────────────────────────────────────
 # URL HELPER
 # ─────────────────────────────────────────────
-DEFAULT_APP_URL = "https://rfidpticmockup-qfn4gve2qgohbwaechw7qh.streamlit.app"
+DEFAULT_APP_URL = "https://rfidpticmockup-qfn4gve2qgohbwaechw7qh.streamlit.app/"
 
 def get_base_url():
     if st.session_state.get("base_url"):
@@ -953,7 +953,7 @@ def _show_edit_form(tag_code, rec, data, is_empty=False):
                     st.text_input(f"Custom {field}",
 
                         value=val, key=f"{wk}_custom",
-                        placeholder=f"Enter {field}...", key="dup_L962")
+                        placeholder=f"Enter {field}...")
 
             else:
                 st.text_input(field, value=val, key=f"{wk}_txt")
